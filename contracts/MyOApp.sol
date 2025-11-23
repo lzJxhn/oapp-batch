@@ -1,120 +1,132 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: MIT
+
 pragma solidity ^0.8.22;
 
-import { OApp, Origin, MessagingFee } from "@layerzerolabs/oapp-evm/contracts/oapp/OApp.sol";
+import { OApp, MessagingFee, Origin } from "@layerzerolabs/oapp-evm/contracts/oapp/OApp.sol";
 import { OAppOptionsType3 } from "@layerzerolabs/oapp-evm/contracts/oapp/libs/OAppOptionsType3.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 
+/**
+ * @title BatchSendMock contract for demonstrating multiple outbound cross-chain calls using LayerZero.
+ * @notice THIS IS AN EXAMPLE CONTRACT. DO NOT USE THIS CODE IN PRODUCTION.
+ * @dev This contract showcases how to send multiple cross-chain calls with one source function call using LayerZero's OApp Standard.
+ */
 contract MyOApp is OApp, OAppOptionsType3 {
-    /// @notice Last string received from any remote chain
-    string public lastMessage;
+    /// @notice Last received message data.
+    string public data = "Nothing received yet";
 
-    /// @notice Msg type for sending a string, for use in OAppOptionsType3 as an enforced option
+    /// @notice Message types that are used to identify the various OApp operations.
+    /// @dev These values are used in things like combineOptions() in OAppOptionsType3 (enforcedOptions).
     uint16 public constant SEND = 1;
 
-    /// @notice Initialize with Endpoint V2 and owner address
-    /// @param _endpoint The local chain's LayerZero Endpoint V2 address
-    /// @param _owner    The address permitted to configure this OApp
-    constructor(address _endpoint, address _owner) OApp(_endpoint, _owner) Ownable(_owner) {}
+    /// @notice Emitted when a message is received from another chain.
+    event MessageReceived(string message, uint32 senderEid, bytes32 sender);
 
-    // ──────────────────────────────────────────────────────────────────────────────
-    // 0. (Optional) Quote business logic
-    //
-    // Example: Get a quote from the Endpoint for a cost estimate of sending a message.
-    // Replace this to mirror your own send business logic.
-    // ──────────────────────────────────────────────────────────────────────────────
+    /// @notice Emitted when a message is sent to another chain (A -> B).
+    event MessageSent(string message, uint32 dstEid);
+
+    /// @dev Revert with this error when an invalid message type is used.
+    error InvalidMsgType();
 
     /**
-     * @notice Quotes the gas needed to pay for the full omnichain transaction in native gas or ZRO token.
-     * @param _dstEid Destination chain's endpoint ID.
-     * @param _string The string to send.
-     * @param _options Message execution options (e.g., for sending gas to destination).
-     * @param _payInLzToken Whether to return fee in ZRO token.
-     * @return fee A `MessagingFee` struct containing the calculated gas fee in either the native token or ZRO token.
+     * @dev Constructs a new BatchSend contract instance.
+     * @param _endpoint The LayerZero endpoint for this contract to interact with.
+     * @param _owner The owner address that will be set as the owner of the contract.
      */
-    function quoteSendString(
-        uint32 _dstEid,
-        string calldata _string,
-        bytes calldata _options,
+    constructor(address _endpoint, address _owner) OApp(_endpoint, _owner) Ownable(msg.sender) {}
+
+    // Override to change fee check from equivalency to < since batch fees are cumulative
+    function _payNative(uint256 _nativeFee) internal override returns (uint256 nativeFee) {
+        if (msg.value < _nativeFee) revert NotEnoughNative(msg.value);
+        return _nativeFee;
+    }
+
+    /**
+     * @notice Returns the estimated messaging fee for a given message.
+     * @param _dstEids Destination endpoint ID array where the message will be batch sent.
+     * @param _msgType The type of message being sent.
+     * @param _message The message content.
+     * @param _extraSendOptions Extra gas options for receiving the send call (A -> B).
+     * Will be summed with enforcedOptions, even if no enforcedOptions are set.
+     * @param _payInLzToken Boolean flag indicating whether to pay in LZ token.
+     * @return totalFee The estimated messaging fee for sending to all pathways.
+     */
+    function quote(
+        uint32[] memory _dstEids,
+        uint16 _msgType,
+        string memory _message, // Semantic naming for message content
+        bytes calldata _extraSendOptions,
         bool _payInLzToken
-    ) public view returns (MessagingFee memory fee) {
-        bytes memory _message = abi.encode(_string);
-        // combineOptions (from OAppOptionsType3) merges enforced options set by the contract owner
-        // with any additional execution options provided by the caller
-        fee = _quote(_dstEid, _message, combineOptions(_dstEid, SEND, _options), _payInLzToken);
+    ) public view returns (MessagingFee memory totalFee) {
+        bytes memory encodedMessage = abi.encode(_message); // Clear distinction: input vs processed
+
+        for (uint i = 0; i < _dstEids.length; i++) {
+            bytes memory options = combineOptions(_dstEids[i], _msgType, _extraSendOptions);
+            MessagingFee memory fee = _quote(_dstEids[i], encodedMessage, options, _payInLzToken);
+            totalFee.nativeFee += fee.nativeFee;
+            totalFee.lzTokenFee += fee.lzTokenFee;
+        }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────────
-    // 1. Send business logic
-    //
-    // Example: send a simple string to a remote chain. Replace this with your
-    // own state-update logic, then encode whatever data your application needs.
-    // ──────────────────────────────────────────────────────────────────────────────
+    function send(
+        uint32[] memory _dstEids,
+        uint16 _msgType,
+        string memory _message,
+        bytes calldata _extraSendOptions // gas settings for A -> B
+    ) external payable {
+        // Message type validation for security and extensibility
+        if (_msgType != SEND) {
+            revert InvalidMsgType();
+        }
 
-    /// @notice Send a string to a remote OApp on another chain
-    /// @param _dstEid   Destination Endpoint ID (uint32)
-    /// @param _string  The string to send
-    /// @param _options  Execution options for gas on the destination (bytes)
-    function sendString(uint32 _dstEid, string calldata _string, bytes calldata _options) external payable {
-        // 1. (Optional) Update any local state here.
-        //    e.g., record that a message was "sent":
-        //    sentCount += 1;
+        // Gas efficiency: calculate total fees upfront (fail-fast pattern)
+        MessagingFee memory totalFee = quote(_dstEids, _msgType, _message, _extraSendOptions, false);
+        require(msg.value >= totalFee.nativeFee, "Insufficient fee provided");
 
-        // 2. Encode any data structures you wish to send into bytes
-        //    You can use abi.encode, abi.encodePacked, or directly splice bytes
-        //    if you know the format of your data structures
-        bytes memory _message = abi.encode(_string);
+        // Encodes the message before invoking _lzSend.
+        bytes memory _encodedMessage = abi.encode(_message);
 
-        // 3. Call OAppSender._lzSend to package and dispatch the cross-chain message
-        //    - _dstEid:   remote chain's Endpoint ID
-        //    - _message:  ABI-encoded string
-        //    - _options:  combined execution options (enforced + caller-provided)
-        //    - MessagingFee(msg.value, 0): pay all gas as native token; no ZRO
-        //    - payable(msg.sender): refund excess gas to caller
-        //
-        //    combineOptions (from OAppOptionsType3) merges enforced options set by the contract owner
-        //    with any additional execution options provided by the caller
-        _lzSend(
-            _dstEid,
-            _message,
-            combineOptions(_dstEid, SEND, _options),
-            MessagingFee(msg.value, 0),
-            payable(msg.sender)
-        );
+        uint256 totalNativeFeeUsed = 0;
+        uint256 remainingValue = msg.value;
+
+        for (uint i = 0; i < _dstEids.length; i++) {
+            bytes memory options = combineOptions(_dstEids[i], _msgType, _extraSendOptions);
+            MessagingFee memory fee = _quote(_dstEids[i], _encodedMessage, options, false);
+
+            totalNativeFeeUsed += fee.nativeFee;
+            remainingValue -= fee.nativeFee;
+
+            // Granular fee tracking per destination
+            require(remainingValue >= 0, "Insufficient fee for this destination");
+
+            _lzSend(
+                _dstEids[i],
+                _encodedMessage,
+                options,
+                fee,
+                payable(msg.sender)
+            );
+
+            emit MessageSent(_message, _dstEids[i]); // Event emission for tracking
+        }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────────
-    // 2. Receive business logic
-    //
-    // Override _lzReceive to decode the incoming bytes and apply your logic.
-    // The base OAppReceiver.lzReceive ensures:
-    //   • Only the LayerZero Endpoint can call this method
-    //   • The sender is a registered peer (peers[srcEid] == origin.sender)
-    // ──────────────────────────────────────────────────────────────────────────────
-
-    /// @notice Invoked by OAppReceiver when EndpointV2.lzReceive is called
-    /// @dev   _origin    Metadata (source chain, sender address, nonce)
-    /// @dev   _guid      Global unique ID for tracking this message
-    /// @param _message   ABI-encoded bytes (the string we sent earlier)
-    /// @dev   _executor  Executor address that delivered the message
-    /// @dev   _extraData Additional data from the Executor (unused here)
+    /**
+     * @notice Internal function to handle receiving messages from another chain.
+     * @dev Decodes and processes the received message based on its type.
+     * @param _origin Data about the origin of the received message.
+     * @param message The received message content.
+     */
     function _lzReceive(
-        Origin calldata /*_origin*/,
-        bytes32 /*_guid*/,
-        bytes calldata _message,
-        address /*_executor*/,
-        bytes calldata /*_extraData*/
+        Origin calldata _origin,
+        bytes32 /*guid*/,
+        bytes calldata message,
+        address, // Executor address as specified by the OApp.
+        bytes calldata // Any extra data or options to trigger on receipt.
     ) internal override {
-        // 1. Decode the incoming bytes into a string
-        //    You can use abi.decode, abi.decodePacked, or directly splice bytes
-        //    if you know the format of your data structures
-        string memory _string = abi.decode(_message, (string));
+        string memory _data = abi.decode(message, (string));
+        data = _data;
 
-        // 2. Apply your custom logic. In this example, store it in `lastMessage`.
-        lastMessage = _string;
-
-        // 3. (Optional) Trigger further on-chain actions.
-        //    e.g., emit an event, mint tokens, call another contract, etc.
-        //    emit MessageReceived(_origin.srcEid, _string);
+        emit MessageReceived(data, _origin.srcEid, _origin.sender);
     }
 }
