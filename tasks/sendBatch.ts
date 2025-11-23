@@ -1,3 +1,7 @@
+//
+//   pnpm hardhat lz:oapp:sendBatch --dst-eids [30184, 30303] --string "test" --network arbitrum-mainnet
+//
+
 import { ContractTransaction } from 'ethers'
 import { task, types } from 'hardhat/config'
 import { HardhatRuntimeEnvironment } from 'hardhat/types'
